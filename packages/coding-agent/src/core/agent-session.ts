@@ -2536,7 +2536,12 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// #3 (window-aware retry budget): cap the exponential backoff so a higher maxRetries
+		// (default raised to 6) can't produce absurd delays — uncapped, baseDelayMs(2000)·2^(n-1)
+		// reaches ~64s by attempt 6. A 30s cap keeps retries dense enough to span a multi-minute
+		// server-outage window (e.g. the periodic UTC-:00/:30 Anthropic-edge disconnect) while
+		// staying bounded.
+		const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), 30000);
 
 		this._emit({
 			type: "auto_retry_start",

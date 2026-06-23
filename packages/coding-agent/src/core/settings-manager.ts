@@ -807,7 +807,11 @@ export class SettingsManager {
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
 		return {
 			enabled: this.getRetryEnabled(),
-			maxRetries: this.settings.retry?.maxRetries ?? 3,
+			// #3 (window-aware retry budget): raise the default 3→6 so connect/idle timeout retries
+			// (zero-token-safe) can ride out a multi-minute server-outage window (e.g. the periodic
+			// UTC-:00/:30 Anthropic-edge disconnect). A user's explicit retry.maxRetries still wins via
+			// ??. Pairs with the 30s backoff cap in agent-session.ts _prepareRetry.
+			maxRetries: this.settings.retry?.maxRetries ?? 6,
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 		};
 	}
