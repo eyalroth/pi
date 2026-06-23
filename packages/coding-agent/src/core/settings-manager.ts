@@ -807,7 +807,9 @@ export class SettingsManager {
 	getRetrySettings(): { enabled: boolean; maxRetries: number; baseDelayMs: number } {
 		return {
 			enabled: this.getRetryEnabled(),
-			maxRetries: this.settings.retry?.maxRetries ?? 3,
+			// Default 3→6 so zero-token-safe connect/idle timeout retries can ride out a
+			// multi-minute provider disruption. An explicit retry.maxRetries still wins via ??.
+			maxRetries: this.settings.retry?.maxRetries ?? 6,
 			baseDelayMs: this.settings.retry?.baseDelayMs ?? 2000,
 		};
 	}

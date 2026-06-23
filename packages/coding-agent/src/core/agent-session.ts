@@ -2523,7 +2523,9 @@ export class AgentSession {
 			return false;
 		}
 
-		const delayMs = settings.baseDelayMs * 2 ** (this._retryAttempt - 1);
+		// Cap the exponential backoff so a higher maxRetries can't produce huge delays, and so
+		// retries stay dense enough to ride out a multi-minute provider disruption.
+		const delayMs = Math.min(settings.baseDelayMs * 2 ** (this._retryAttempt - 1), 30000);
 
 		this._emit({
 			type: "auto_retry_start",
