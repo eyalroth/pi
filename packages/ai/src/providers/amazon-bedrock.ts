@@ -300,6 +300,20 @@ function formatBedrockError(error: unknown): string {
 		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
 		return `${prefix}: ${message}`;
 	}
+	// Bug 2a: unmodeled Bedrock mid-stream exceptions are thrown by the Smithy
+	// event-stream unmarshaller as a plain `Error` whose `.message` is the raw
+	// response body and whose `.name` is the wire `:exception-type` / `:error-code`
+	// (getMessageUnmarshaller's `$unknown` branch: `new Error(toUtf8(message.body))`).
+	// These are NOT `instanceof BedrockRuntimeServiceException`, so without this branch
+	// they reach the caller as a bare body like
+	// `{"message":"The system encountered an unexpected error during processing. Try
+	// your request again."}` with no category prefix — which makes the downstream
+	// keyword-based retry classifier miss them and surface a transient error as fatal.
+	// Preserve the same prefix convention so a structured category survives downstream.
+	if (error instanceof Error && typeof error.name === "string" && error.name && error.name !== "Error") {
+		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
+		return `${prefix}: ${message}`;
+	}
 	return message;
 }
 
