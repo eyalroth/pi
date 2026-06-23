@@ -328,6 +328,14 @@ function formatBedrockError(error: unknown): string {
 		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
 		return `${prefix}: ${message}${dataRetentionHint}`;
 	}
+	// Unmodeled stream exceptions are thrown by the Smithy unmarshaller as a plain
+	// `Error` (not a BedrockRuntimeServiceException), so without this branch they reach
+	// the caller with no category prefix and defeat the retry classifier. Apply the same
+	// prefix convention using the wire exception type on `.name`.
+	if (error instanceof Error && typeof error.name === "string" && error.name && error.name !== "Error") {
+		const prefix = BEDROCK_ERROR_PREFIXES[error.name] ?? error.name;
+		return `${prefix}: ${message}${dataRetentionHint}`;
+	}
 	return `${message}${dataRetentionHint}`;
 }
 
