@@ -449,6 +449,99 @@ async function* iterateAnthropicEvents(
 	}
 }
 
+// Bug 1 (Anthropic): idle-timeout watchdog for the streaming read loop.
+// Without this, a half-open/wedged socket (open, but no further SSE events and no
+// FIN/RST) blocks the `await reader.read()` inside iterateSseMessages forever — the same
+// permanent "Working…" hang Bug 1 fixed for Bedrock. The SDK request `timeout` only guards
+// the pre-stream phase (headers); it does NOT cover a mid-stream stall. We race each event
+// read against an idle timer that RESETS on every event; on prolonged total silence we throw
+// a timeout error (retryable via /timeout/), so auto-retry recovers instead of hanging.
+// Mirrors the Bedrock watchdog exactly. The idle window is generous — a live stream emits
+// events every few seconds — so this never fires on a legitimately long/slow turn.
+const DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_MS = 240000;
+function resolveAnthropicStreamIdleTimeoutMs(options?: AnthropicOptions): number {
+	const v = options?.streamIdleTimeoutMs;
+	if (v === undefined || v === null) return DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_MS;
+	if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0; // explicit 0 / invalid → disabled
+	return Math.floor(v);
+}
+async function* withAnthropicIdleTimeout<T>(source: AsyncIterable<T>, idleMs: number): AsyncGenerator<T> {
+	const iterator = source[Symbol.asyncIterator]();
+	try {
+		while (true) {
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const idle = new Promise<never>((_resolve, reject) => {
+				timer = setTimeout(() => reject(new Error(`Anthropic stream idle timeout after ${idleMs}ms`)), idleMs);
+			});
+			let result: IteratorResult<T>;
+			try {
+				result = await Promise.race([iterator.next(), idle]);
+			} finally {
+				clearTimeout(timer);
+			}
+			if (result.done) return;
+			yield result.value;
+		}
+	} finally {
+		// Best-effort release of the underlying stream on early exit (timeout/abort/break).
+		try {
+			await iterator.return?.();
+		} catch {
+			/* ignore */
+		}
+	}
+}
+// #1 (Anthropic connect timeout): pre-stream/first-byte timeout for the
+// client.messages.create(...).asResponse() await (the response-headers phase). The idle watchdog
+// above wraps the EVENT stream ONLY; obtaining the response (headers) is guarded just by the SDK
+// `timeout` (~300s) — too slow for the silent, periodic UTC-:00/:30 Anthropic-edge disconnect,
+// which can leave pi on "Working…" with no error for minutes (no self-recovery but Esc). Mirror the
+// Bedrock D11 fix: race the asResponse() promise against a 30s timer using a COMPOSITE
+// AbortController that forwards the caller's signal (so Esc still cancels during BOTH connect and
+// streaming — only the timer is cleared once the response resolves), and on expiry abort the
+// in-flight request and throw a /timeout/-retryable error. A pre-stream timeout has generated zero
+// tokens, so the retry is strictly safe (nothing discarded) — hence this window is tight (30s)
+// while the mid-stream idle window stays generous (DEFAULT_ANTHROPIC_STREAM_IDLE_TIMEOUT_MS).
+const DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_MS = 30000;
+function resolveAnthropicConnectTimeoutMs(options?: AnthropicOptions): number {
+	const v = options?.connectTimeoutMs;
+	if (v === undefined || v === null) return DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_MS;
+	if (typeof v !== "number" || !Number.isFinite(v) || v <= 0) return 0; // explicit 0 / invalid → disabled
+	return Math.floor(v);
+}
+async function sendWithAnthropicConnectTimeout<T>(
+	send: (abortSignal: AbortSignal | undefined) => Promise<T>,
+	userSignal: AbortSignal | undefined,
+	connectMs: number,
+): Promise<T> {
+	// `send` is a thunk (abortSignal) => Promise<response>. We pass it a COMPOSITE signal that
+	// aborts when EITHER the caller's signal aborts OR our connect timer fires.
+	if (!(connectMs > 0)) return send(userSignal);
+	const controller = new AbortController();
+	const forwardAbort = () => controller.abort(userSignal?.reason);
+	if (userSignal) {
+		if (userSignal.aborted) controller.abort(userSignal.reason);
+		else userSignal.addEventListener("abort", forwardAbort, { once: true });
+	}
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	const timeout = new Promise<never>((_resolve, reject) => {
+		timer = setTimeout(() => {
+			controller.abort();
+			reject(new Error(`Anthropic connect/first-byte timeout after ${connectMs}ms`));
+		}, connectMs);
+	});
+	const sendPromise = send(controller.signal);
+	// Swallow a late abort-rejection from the losing promise if the timeout won the race.
+	sendPromise.catch(() => {});
+	try {
+		return await Promise.race([sendPromise, timeout]);
+	} finally {
+		// Clear ONLY the connect timer; keep forwarding caller aborts to the composite signal for
+		// the rest of the turn so Esc still cancels the stream read that follows.
+		clearTimeout(timer);
+	}
+}
+
 export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 	model: Model<"anthropic-messages">,
 	context: Context,
@@ -523,14 +616,29 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 				...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {}),
 				maxRetries: options?.maxRetries ?? 0,
 			};
-			const response = await client.messages.create({ ...params, stream: true }, requestOptions).asResponse();
+			// #1 (Anthropic connect timeout): guard the pre-stream/headers phase (see helper above).
+			const connectTimeoutMs = resolveAnthropicConnectTimeoutMs(options);
+			const response = await sendWithAnthropicConnectTimeout(
+				(abortSignal) =>
+					client.messages
+						.create({ ...params, stream: true }, { ...requestOptions, signal: abortSignal })
+						.asResponse(),
+				options?.signal,
+				connectTimeoutMs,
+			);
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
 
 			type Block = (ThinkingContent | TextContent | (ToolCall & { partialJson: string })) & { index: number };
 			const blocks = output.content as Block[];
 
-			for await (const event of iterateAnthropicEvents(response, options?.signal)) {
+			// Bug 1 (Anthropic): wrap the event stream in the idle watchdog (see helper above).
+			const streamIdleTimeoutMs = resolveAnthropicStreamIdleTimeoutMs(options);
+			const eventSource =
+				streamIdleTimeoutMs > 0
+					? withAnthropicIdleTimeout(iterateAnthropicEvents(response, options?.signal), streamIdleTimeoutMs)
+					: iterateAnthropicEvents(response, options?.signal);
+			for await (const event of eventSource) {
 				if (event.type === "message_start") {
 					output.responseId = event.message.id;
 					// Capture initial token usage from message_start event
