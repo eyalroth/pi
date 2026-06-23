@@ -156,6 +156,28 @@ export interface StreamOptions {
 	 */
 	websocketConnectTimeoutMs?: number;
 	/**
+	 * Idle-timeout watchdog window in milliseconds for the streaming read loop
+	 * (HTTP/SSE providers that support it, e.g. Bedrock and Anthropic). The timer
+	 * resets on every received stream event; if the stream goes totally silent for
+	 * longer than this window (a half-open/wedged socket — open, but no further
+	 * events and no FIN/RST), the provider throws a retryable timeout error instead
+	 * of hanging forever on a permanent "Working…". Distinct from `timeoutMs` (the
+	 * SDK request timeout) and from the codex WebSocket `websocketConnectTimeoutMs`.
+	 * Generous by design so it never fires on a legitimately slow turn. `undefined`
+	 * uses the provider default; `0`/invalid disables the watchdog.
+	 */
+	streamIdleTimeoutMs?: number;
+	/**
+	 * Pre-stream connect/first-byte timeout window in milliseconds for providers
+	 * that support it (e.g. Bedrock `client.send()`, Anthropic `asResponse()`). The
+	 * idle watchdog above guards the event stream only; obtaining the response
+	 * headers has no fast timeout, so a connection that is accepted but never returns
+	 * headers hangs silently. This tight window aborts the in-flight request and
+	 * throws a retryable timeout error; safe to retry because zero tokens were
+	 * generated. `undefined` uses the provider default; `0`/invalid disables it.
+	 */
+	connectTimeoutMs?: number;
+	/**
 	 * Maximum retry attempts for providers/SDKs that support client-side retries.
 	 * For example, OpenAI and Anthropic SDK clients default to 2.
 	 */
