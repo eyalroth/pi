@@ -482,7 +482,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			timestamp: Date.now(),
 		};
 
-		let releaseConnectSignals: () => void = () => {};
 		try {
 			let client: Anthropic;
 			let isOAuth: boolean;
@@ -533,24 +532,21 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			};
 			// Abort the request if response headers don't arrive in time (pre-stream phase only).
 			const connectTimeoutMs = resolveTimeoutMs(options?.connectTimeoutMs, DEFAULT_ANTHROPIC_CONNECT_TIMEOUT_MS);
-			const connectTimeout = createConnectTimeout(
-				connectTimeoutMs,
-				() => new Error(`Anthropic connect/first-byte timeout after ${connectTimeoutMs}ms`),
-			);
-			// This signal also governs the response body read below, so keep it alive for the whole
-			// turn (Esc still cancels) and release it in the outer finally.
+			const connectTimeout = createConnectTimeout(connectTimeoutMs);
 			const connectSignals = combineAbortSignals([options?.signal, connectTimeout.signal]);
-			releaseConnectSignals = connectSignals.cleanup;
 			let response: Response;
 			try {
 				response = await client.messages
 					.create({ ...params, stream: true }, { ...requestOptions, signal: connectSignals.signal })
 					.asResponse();
 			} catch (error) {
-				const timeoutError = connectTimeout.error();
-				throw timeoutError && !options?.signal?.aborted ? timeoutError : error;
+				if (connectTimeout.signal.aborted && !options?.signal?.aborted) {
+					throw new Error(`Anthropic connect/first-byte timeout after ${connectTimeoutMs}ms`);
+				}
+				throw error;
 			} finally {
-				connectTimeout.clear();
+				connectTimeout.clearTimeout();
+				connectSignals.cleanup();
 			}
 			await options?.onResponse?.({ status: response.status, headers: headersToRecord(response.headers) }, model);
 			stream.push({ type: "start", partial: output });
@@ -753,8 +749,6 @@ export const stream: StreamFunction<"anthropic-messages", AnthropicOptions> = (
 			output.errorMessage = error instanceof Error ? error.message : JSON.stringify(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
-		} finally {
-			releaseConnectSignals();
 		}
 	})();
 

@@ -210,7 +210,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
-		let releaseConnectSignals: () => void = () => {};
 		try {
 			const client = new BedrockRuntimeClient(config);
 			if (options.headers && Object.keys(options.headers).length > 0) {
@@ -238,22 +237,19 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 
 			// Abort the request if response headers don't arrive in time (pre-stream phase only).
 			const connectTimeoutMs = resolveTimeoutMs(options.connectTimeoutMs, DEFAULT_BEDROCK_CONNECT_TIMEOUT_MS);
-			const connectTimeout = createConnectTimeout(
-				connectTimeoutMs,
-				() => new Error(`Bedrock connect/first-byte timeout after ${connectTimeoutMs}ms`),
-			);
-			// This signal also governs the stream body below, so keep it alive for the whole turn
-			// (Esc still cancels) and release it in the outer finally.
+			const connectTimeout = createConnectTimeout(connectTimeoutMs);
 			const connectSignals = combineAbortSignals([options.signal, connectTimeout.signal]);
-			releaseConnectSignals = connectSignals.cleanup;
 			let response: ConverseStreamCommandOutput;
 			try {
 				response = await client.send(command, { abortSignal: connectSignals.signal });
 			} catch (error) {
-				const timeoutError = connectTimeout.error();
-				throw timeoutError && !options.signal?.aborted ? timeoutError : error;
+				if (connectTimeout.signal.aborted && !options?.signal?.aborted) {
+					throw new Error(`Bedrock connect/first-byte timeout after ${connectTimeoutMs}ms`);
+				}
+				throw error;
 			} finally {
-				connectTimeout.clear();
+				connectTimeout.clearTimeout();
+				connectSignals.cleanup();
 			}
 			if (response.$metadata.httpStatusCode !== undefined) {
 				const responseHeaders: Record<string, string> = {};
@@ -324,8 +320,6 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			output.errorMessage = formatBedrockError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
-		} finally {
-			releaseConnectSignals();
 		}
 	})();
 
