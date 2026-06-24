@@ -13,6 +13,7 @@ import {
 	type ContentBlockStopEvent,
 	ConversationRole,
 	ConverseStreamCommand,
+	type ConverseStreamCommandOutput,
 	type ConverseStreamMetadataEvent,
 	ImageFormat,
 	type Message,
@@ -47,11 +48,13 @@ import type {
 	ToolCall,
 	ToolResultMessage,
 } from "../types.ts";
+import { combineAbortSignals } from "../utils/abort-signals.ts";
 import { AssistantMessageEventStream } from "../utils/event-stream.ts";
 import { parseStreamingJson } from "../utils/json-parse.ts";
 import { resolveHttpProxyUrlForTarget } from "../utils/node-http-proxy.ts";
 import { getProviderEnvValue } from "../utils/provider-env.ts";
 import { sanitizeSurrogates } from "../utils/sanitize-unicode.ts";
+import { createConnectTimeout, resolveTimeoutMs, withStreamIdleTimeout } from "../utils/stream-timeouts.ts";
 import { adjustMaxTokensForThinking, buildBaseOptions, clampReasoning } from "./simple-options.ts";
 import { transformMessages } from "./transform-messages.ts";
 
@@ -94,6 +97,11 @@ export interface BedrockOptions extends StreamOptions {
 type Block = (TextContent | ThinkingContent | ToolCall) & { index?: number; partialJson?: string };
 
 const EMPTY_TEXT_PLACEHOLDER = "<empty>";
+
+// Idle window for the stream read loop and connect window for the pre-stream phase; both
+// default-on and overridable via streamIdleTimeoutMs / connectTimeoutMs (0 disables).
+const DEFAULT_BEDROCK_STREAM_IDLE_TIMEOUT_MS = 240_000;
+const DEFAULT_BEDROCK_CONNECT_TIMEOUT_MS = 30_000;
 
 export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> = (
 	model: Model<"bedrock-converse-stream">,
@@ -202,6 +210,7 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			config.authSchemePreference = ["httpBearerAuth"];
 		}
 
+		let releaseConnectSignals: () => void = () => {};
 		try {
 			const client = new BedrockRuntimeClient(config);
 			if (options.headers && Object.keys(options.headers).length > 0) {
@@ -227,7 +236,25 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			}
 			const command = new ConverseStreamCommand(commandInput);
 
-			const response = await client.send(command, { abortSignal: options.signal });
+			// Abort the request if response headers don't arrive in time (pre-stream phase only).
+			const connectTimeoutMs = resolveTimeoutMs(options.connectTimeoutMs, DEFAULT_BEDROCK_CONNECT_TIMEOUT_MS);
+			const connectTimeout = createConnectTimeout(
+				connectTimeoutMs,
+				() => new Error(`Bedrock connect/first-byte timeout after ${connectTimeoutMs}ms`),
+			);
+			// This signal also governs the stream body below, so keep it alive for the whole turn
+			// (Esc still cancels) and release it in the outer finally.
+			const connectSignals = combineAbortSignals([options.signal, connectTimeout.signal]);
+			releaseConnectSignals = connectSignals.cleanup;
+			let response: ConverseStreamCommandOutput;
+			try {
+				response = await client.send(command, { abortSignal: connectSignals.signal });
+			} catch (error) {
+				const timeoutError = connectTimeout.error();
+				throw timeoutError && !options.signal?.aborted ? timeoutError : error;
+			} finally {
+				connectTimeout.clear();
+			}
 			if (response.$metadata.httpStatusCode !== undefined) {
 				const responseHeaders: Record<string, string> = {};
 				if (response.$metadata.requestId) {
@@ -236,7 +263,19 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 				await options?.onResponse?.({ status: response.$metadata.httpStatusCode, headers: responseHeaders }, model);
 			}
 
-			for await (const item of response.stream!) {
+			const streamIdleTimeoutMs = resolveTimeoutMs(
+				options.streamIdleTimeoutMs,
+				DEFAULT_BEDROCK_STREAM_IDLE_TIMEOUT_MS,
+			);
+			const streamSource =
+				streamIdleTimeoutMs > 0
+					? withStreamIdleTimeout(
+							response.stream!,
+							streamIdleTimeoutMs,
+							() => new Error(`Bedrock stream idle timeout after ${streamIdleTimeoutMs}ms`),
+						)
+					: response.stream!;
+			for await (const item of streamSource) {
 				if (item.messageStart) {
 					if (item.messageStart.role !== ConversationRole.ASSISTANT) {
 						throw new Error("Unexpected assistant message start but got user message start instead");
@@ -285,6 +324,8 @@ export const stream: StreamFunction<"bedrock-converse-stream", BedrockOptions> =
 			output.errorMessage = formatBedrockError(error);
 			stream.push({ type: "error", reason: output.stopReason, error: output });
 			stream.end();
+		} finally {
+			releaseConnectSignals();
 		}
 	})();
 
